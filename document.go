@@ -9,6 +9,7 @@ import "regexp"
 import "strings"
 import "time"
 import "github.com/yuin/goldmark"
+import "github.com/yuin/goldmark/extension"
 import goldhtml "github.com/yuin/goldmark/renderer/html"
 import nethtml "golang.org/x/net/html"
 import "golang.org/x/net/html/atom"
@@ -533,6 +534,7 @@ func (document *Document) input_html() (string, error) {
 	var root *nethtml.Node
 
 	parser = goldmark.New(
+		goldmark.WithExtensions(extension.GFM),
 		goldmark.WithRendererOptions(goldhtml.WithUnsafe()),
 	)
 
@@ -606,6 +608,10 @@ func (document *Document) process_html() error {
 	document.html_filter_heading_anchors(root)
 	document.html_filter_annotate_bare_links(root)
 	err = document.html_filter_manual_reference_links(root)
+	if err != nil {
+		return err
+	}
+	err = document.html_filter_literal_angle_tags(root)
 	if err != nil {
 		return err
 	}
@@ -703,8 +709,15 @@ func (document *Document) markdown_filter_heading_anchors(markdown string) strin
 
 func (document *Document) markdown_filter_angle_quotes(markdown string) string {
 	var output string
+	var escaped_left string
+	var escaped_right string
 
-	output = angle_quote_pattern.ReplaceAllStringFunc(markdown, func(match string) string {
+	escaped_left = "\x00gonn_lt\x00"
+	escaped_right = "\x00gonn_gt\x00"
+	output = strings.ReplaceAll(markdown, `\<`, escaped_left)
+	output = strings.ReplaceAll(output, `\>`, escaped_right)
+
+	output = angle_quote_pattern.ReplaceAllStringFunc(output, func(match string) string {
 		var parts []string
 		var contents string
 		var tag string
@@ -716,7 +729,7 @@ func (document *Document) markdown_filter_angle_quotes(markdown string) string {
 		if len(parts) == 2 {
 			attrs = parts[1]
 		}
-		if strings.Contains(attrs, "/=") || has_html_element(strings.TrimPrefix(tag, "/")) || strings.Contains(document.Data, "</"+tag+">") {
+		if strings.HasPrefix(contents, "!") || strings.Contains(attrs, "/=") || has_html_element(strings.TrimPrefix(tag, "/")) || strings.Contains(document.Data, "</"+tag+">") {
 			return match
 		}
 		return "<var>" + contents + "</var>"
@@ -734,7 +747,7 @@ func (document *Document) markdown_filter_angle_quotes(markdown string) string {
 		if len(parts) == 2 {
 			attrs = parts[1]
 		}
-		if strings.Contains(contents, "://") || strings.Contains(contents, "@") || strings.Contains(attrs, "/=") || has_html_element(strings.TrimPrefix(tag, "/")) || strings.Contains(document.Data, "</"+tag+">") {
+		if strings.HasPrefix(contents, "!") || strings.Contains(contents, "://") || strings.Contains(contents, "@") || strings.Contains(attrs, "/=") || has_html_element(strings.TrimPrefix(tag, "/")) || strings.Contains(document.Data, "</"+tag+">") {
 			return match
 		}
 		if strings.ContainsAny(contents, ":.") {
@@ -742,6 +755,9 @@ func (document *Document) markdown_filter_angle_quotes(markdown string) string {
 		}
 		return match
 	})
+
+	output = strings.ReplaceAll(output, escaped_left, `\<`)
+	output = strings.ReplaceAll(output, escaped_right, `\>`)
 
 	return output
 }
@@ -774,6 +790,95 @@ func (document *Document) html_filter_angle_quotes(root *nethtml.Node) {
 	}
 }
 
+func html_should_convert_literal_angle_tag(contents string) bool {
+	if !strings.ContainsAny(contents, ":.") {
+		return false
+	}
+	if strings.Contains(contents, "://") || strings.Contains(contents, "@") || strings.HasPrefix(contents, "!") {
+		return false
+	}
+	return true
+}
+
+func (document *Document) html_build_literal_angle_markup(text string) (string, bool) {
+	var matches [][]int
+	var builder strings.Builder
+	var last int
+	var index int
+	var contents string
+	var changed bool
+	var opened []string
+	var close_index int
+
+	matches = literal_angle_pattern.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return "", false
+	}
+
+	last = 0
+	changed = false
+	opened = make([]string, 0, len(matches))
+	for index = 0; index < len(matches); index++ {
+		contents = text[matches[index][2]:matches[index][3]]
+		if !html_should_convert_literal_angle_tag(contents) {
+			continue
+		}
+		builder.WriteString(escape_html_text(text[last:matches[index][0]]))
+		builder.WriteString("<")
+		builder.WriteString(contents)
+		builder.WriteString(">")
+		last = matches[index][1]
+		opened = append(opened, contents)
+		changed = true
+	}
+
+	if !changed {
+		return "", false
+	}
+
+	builder.WriteString(escape_html_text(text[last:]))
+	for close_index = len(opened) - 1; close_index >= 0; close_index-- {
+		builder.WriteString("</")
+		builder.WriteString(opened[close_index])
+		builder.WriteString(">")
+	}
+	return builder.String(), true
+}
+
+func (document *Document) html_filter_literal_angle_tags(root *nethtml.Node) error {
+	var text_nodes []*nethtml.Node
+	var index int
+	var markup string
+	var changed bool
+	var err error
+
+	text_nodes = make([]*nethtml.Node, 0)
+
+	walk_nodes(root, func(node *nethtml.Node) bool {
+		if node.Type == nethtml.TextNode && !child_of(node, "code") {
+			text_nodes = append(text_nodes, node)
+		}
+		return true
+	})
+
+	for index = 0; index < len(text_nodes); index++ {
+		if text_nodes[index].Parent == nil {
+			continue
+		}
+		markup, changed = document.html_build_literal_angle_markup(text_nodes[index].Data)
+		if !changed {
+			continue
+		}
+		_, err = insert_before_html(text_nodes[index], markup, text_nodes[index].Parent)
+		if err != nil {
+			return err
+		}
+		remove_node(text_nodes[index])
+	}
+
+	return nil
+}
+
 func (document *Document) html_filter_definition_lists(root *nethtml.Node) error {
 	var ul_nodes []*nethtml.Node
 	var index int
@@ -784,7 +889,7 @@ func (document *Document) html_filter_definition_lists(root *nethtml.Node) error
 	var container *nethtml.Node
 	var html_source string
 	var parts []string
-	var dt *nethtml.Node
+	var child *nethtml.Node
 	var err error
 
 	ul_nodes = make([]*nethtml.Node, 0)
@@ -802,11 +907,11 @@ func (document *Document) html_filter_definition_lists(root *nethtml.Node) error
 		if len(items) == 0 {
 			continue
 		}
-		for item_index = 0; item_index < len(items); item_index++ {
-			item = items[item_index]
-			container = first_descendant_by_tag(item, "p")
-			if container == nil {
-				container = item
+	for item_index = 0; item_index < len(items); item_index++ {
+		item = items[item_index]
+		container = first_descendant_by_tag(item, "p")
+		if container == nil {
+			container = item
 			}
 			html_source = render_children(container)
 			if !strings.Contains(html_source, ":\n") {
@@ -831,12 +936,9 @@ func (document *Document) html_filter_definition_lists(root *nethtml.Node) error
 			if len(parts) != 2 {
 				continue
 			}
-			dt, err = insert_before_html(item, "<dt>"+parts[0]+"</dt>", ul)
+			_, err = insert_before_html(item, "<dt>"+parts[0]+"</dt>", ul)
 			if err != nil {
 				return err
-			}
-			if dt != nil && len(strings.TrimSpace(collect_text(dt))) <= 7 {
-				append_class(dt, "flush")
 			}
 			rename_element(item, "dd")
 			if container == item {
@@ -846,6 +948,15 @@ func (document *Document) html_filter_definition_lists(root *nethtml.Node) error
 			}
 			if err != nil {
 				return err
+			}
+			container = first_element_child(item)
+			if container != nil && container.Type == nethtml.ElementNode && strings.ToLower(container.Data) == "p" {
+				for container.FirstChild != nil {
+					child = container.FirstChild
+					container.RemoveChild(child)
+					item.InsertBefore(child, container)
+				}
+				remove_node(container)
 			}
 		}
 	}
@@ -905,7 +1016,7 @@ func (document *Document) html_filter_heading_anchors(root *nethtml.Node) {
 			return true
 		}
 		lower = strings.ToLower(node.Data)
-		if lower != "h2" && lower != "h3" && lower != "h4" && lower != "h5" && lower != "h6" {
+		if lower != "h1" && lower != "h2" && lower != "h3" && lower != "h4" && lower != "h5" && lower != "h6" {
 			return true
 		}
 		if ok {

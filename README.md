@@ -19,6 +19,7 @@ manual pages.
 other contributors to `ronn`. Credit for the original design, document
 format, and Ruby implementation belongs to the `ronn` project.
 
-Original project:
+Original projects:
 
 - https://github.com/rtomayko/ronn
+- https://github.com/apjanke/ronn-ng
